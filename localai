@@ -499,13 +499,43 @@ def run_turn(messages, api_url, api_key, model):
         return content
 
 
-def save_model(model):
-    data = Config.load()
-    data["model"] = model
-    Config.save(data)
-    print(f"  Switched to {model!r} (saved to {CONFIG_FILE})")
-    if os.environ.get("LOCALAI_MODEL"):
-        print("  Note: LOCALAI_MODEL is set in your environment and will override this next run.")
+def announce_model_switch(model):
+    print(f"  Using {model!r} for this session only (config unchanged).")
+    print(f"  To make it permanent: localai config set model {model}")
+
+
+def mask_secret(value):
+    if not value:
+        return "<not set>"
+    return "****" + value[-4:] if len(value) > 8 else "****"
+
+
+def print_config(active_model=None):
+    """Print each setting's saved value, env override, and (optionally) the model in use."""
+    env_names = {"api_key": "LOCALAI_API_KEY", "model": "LOCALAI_MODEL", "url": "LOCALAI_URL"}
+    disk = Config.load()
+    for k, env_name in env_names.items():
+        disk_val = disk.get(k)
+        env_val = os.environ.get(env_name)
+        if k == "api_key":
+            disk_val = mask_secret(disk_val) if disk_val else None
+            env_val = mask_secret(env_val) if env_val else None
+        saved_text = repr(disk_val) if disk_val else "<not set>"
+        env_text = repr(env_val) if env_val else "<not set>"
+        print(f"  {k}: saved={saved_text}, env={env_text}")
+    if active_model:
+        print(f"  active model (this session): {active_model!r}")
+
+
+def print_available_models(api_url, api_key):
+    """Print the chat models the server offers."""
+    available = list_models(api_url, api_key)
+    if not available:
+        print("Could not fetch the model list from the server.")
+        return
+    print("Available models:")
+    for m in available:
+        print(f"  {m}")
 
 
 def print_ai_response(content):
@@ -534,12 +564,11 @@ def main():
             data[key] = value
             Config.save(data)
             print(f"Saved {valid_keys[key]}={value!r} to {CONFIG_FILE}")
+        elif len(sys.argv) > 3 and sys.argv[2] == "list" and sys.argv[3] == "model":
+            print_available_models(api_url, api_key)
         else:
-            print(f"# Current config (overrides via env vars are shown in parens):")
-            for k in ("api_key", "model", "url"):
-                env_var = os.environ.get(valid_keys[k], "<not set>")
-                disk_val = config.get(k, "<not set>")
-                print(f"#   {k}: disk={disk_val!r}, env={env_var!r}")
+            print("# Current config:")
+            print_config()
         return
 
     # ── Initialize messages ────────────────────────────────────────────────
@@ -638,13 +667,13 @@ def main():
         new_model = prompt_model_switch(ModelUnavailable(model, available))
         if new_model:
             model = new_model
-            save_model(model)
+            announce_model_switch(model)
         print()
 
     print(f"Chatting with {model} (filesystem + shell tools enabled)")
     print("  Type 'exit' to quit, 'history' to view commands,")
     print("  'session save/load/list/info/clear <name>' to manage conversation history,")
-    print("  'config set <key> <value>' to update settings,")
+    print("  'config set <key> <value>' to update settings, 'config' to show settings, 'config list model' to list models,")
     print("  'clear' to clear current conversation,")
     print("  '!' to run a shell command.")
 
@@ -757,6 +786,16 @@ def main():
                 print(f"\n  Unknown session command: {sub}")
             continue
 
+        if stripped in ("config", "config list"):
+            print()
+            print_config(model)
+            continue
+
+        if stripped in ("config list model", "config list models"):
+            print()
+            print_available_models(api_url, api_key)
+            continue
+
         if stripped.startswith("config set "):
             parts = stripped.split(" ", 3)
             if len(parts) >= 4:
@@ -799,7 +838,7 @@ def main():
                         print("(cancelled)")
                         break
                     model = new_model
-                    save_model(model)
+                    announce_model_switch(model)
         except KeyboardInterrupt:
             del messages[checkpoint:]
             print("\n(interrupted)")

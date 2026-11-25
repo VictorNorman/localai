@@ -31,6 +31,9 @@ or persist them with:
 
 which writes to `~/.localai/config.json`.
 
+Show the current settings with `localai config` (or `config` at the interactive
+prompt, which also shows the model in use this session). The API key is masked.
+
 ### macOS note
 
 macOS's stdlib `readline` module is backed by libedit, which mis-renders
@@ -87,10 +90,14 @@ API key) and suggests alternatives instead of showing a raw HTTP error.
 
 - **Interactive mode** checks the model at startup and again if a request
   fails. It shows a numbered list of available models; pick one by number or
-  name, and the choice is saved to `~/.localai/config.json`. After a failed
-  request, your message is retried with the new model. A blank answer cancels.
+  name. The choice applies to the current run only and is not saved; use
+  `config set model <name>` to make it permanent. After a failed request, your
+  message is retried with the new model. A blank answer cancels.
 - **Batch mode** prints the available models and a
   `localai config set model <name>` hint, then exits.
+
+List the available models at any time with `localai config list model`
+(or `config list model` at the interactive prompt).
 
 The list includes only chat models. The server doesn't label models by type,
 so embedding, reranking, speech, and image-generation models are filtered out
