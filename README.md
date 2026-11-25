@@ -52,14 +52,32 @@ One-shot batch mode:
 ./localai "list the files in this directory"
 ```
 
-Session management:
+### Sessions
 
-```sh
-./localai session save|load|clear|info|export [file]
-```
+Every run starts with a clean conversation; nothing is loaded automatically,
+and a conversation is lost on exit unless you save it under a name. Saved
+sessions live in `~/.localai/sessions/<name>.json`. Command-line input history
+(not the conversation) is kept in `~/.localai/history.json`.
 
-Conversation history is persisted to `~/.localai/current_session.json`
-between runs. Command-line input history is kept in `~/.localai/history.json`.
+Inside the interactive prompt:
+
+| Command                | Effect                                                            |
+| ---------------------- | ----------------------------------------------------------------- |
+| `session save [name]`  | Save the conversation (under the active name if none is given)    |
+| `session load <name>`  | Replace the current conversation with a saved one                 |
+| `session list`         | List saved sessions (the active one is marked `*`)                |
+| `session info [name]`  | Show a session's file, last-modified time, and message count      |
+| `session clear <name>` | Delete a saved session                                            |
+
+Once you save or load a session, it becomes the active session and is
+re-saved automatically after every turn. `clear` (on its own) starts a fresh
+conversation.
+
+From the shell, `./localai session list|info|clear <name>` manage saved
+sessions, and `./localai session export <name> [file]` writes a saved
+session's messages to a JSON file (default `<name>.json`). The shell forms of
+`save` and `load` don't carry a conversation between runs, so use them from
+the interactive prompt instead.
 
 ## Model suggestions
 
