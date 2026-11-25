@@ -60,3 +60,24 @@ Session management:
 
 Conversation history is persisted to `~/.localai/current_session.json`
 between runs. Command-line input history is kept in `~/.localai/history.json`.
+
+## Model suggestions
+
+If the configured model isn't served by the instance, `localai` queries the
+server's model list (`/api/models`, derived from `LOCALAI_URL`, using the same
+API key) and suggests alternatives instead of showing a raw HTTP error.
+
+- **Interactive mode** checks the model at startup and again if a request
+  fails. It shows a numbered list of available models; pick one by number or
+  name, and the choice is saved to `~/.localai/config.json`. After a failed
+  request, your message is retried with the new model. A blank answer cancels.
+- **Batch mode** prints the available models and a
+  `localai config set model <name>` hint, then exits.
+
+The list includes only chat models. The server doesn't label models by type,
+so embedding, reranking, speech, and image-generation models are filtered out
+by name (see `NON_CHAT_PATTERN` in `localai`), along with models marked
+inactive. If the model list can't be fetched, the original error is shown.
+
+If `LOCALAI_MODEL` is set in your environment, it overrides the saved choice on
+the next run.
