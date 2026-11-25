@@ -8,10 +8,8 @@ Config comes from env vars or ~/.localai/config.json:
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
-import textwrap
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -36,7 +34,7 @@ init()
 LOCALAI_DIR = Path.home() / ".localai"
 CONFIG_FILE = LOCALAI_DIR / "config.json"
 HISTORY_FILE = LOCALAI_DIR / "history.json"
-SESSION_FILE = LOCALAI_DIR / "current_session.json"
+SESSIONS_DIR = LOCALAI_DIR / "sessions"
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
 
@@ -73,25 +71,70 @@ class Config:
 # ── Session helpers ────────────────────────────────────────────────────────────
 
 class Session:
-    """Persist conversation history between runs."""
+    """Persist named conversation histories to disk.
+
+    Nothing is loaded automatically -- every run starts from a clean
+    conversation. Conversations are only written to disk when the user
+    explicitly names and saves them (`session save <name>`).
+    """
 
     @classmethod
-    def load(cls):
-        if SESSION_FILE.exists():
-            with open(SESSION_FILE) as f:
-                data = json.load(f)
-            return data.get("messages", [])
-        return []
+    def _path(cls, name):
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "session"
+        return SESSIONS_DIR / f"{safe}.json"
 
     @classmethod
-    def save(cls, messages):
-        LOCALAI_DIR.mkdir(parents=True, exist_ok=True)
-        with open(SESSION_FILE, "w") as f:
-            json.dump({"messages": messages, "updated": datetime.now().isoformat()}, f, indent=2)
+    def exists(cls, name):
+        return cls._path(name).exists()
 
     @classmethod
-    def clear(cls):
-        SESSION_FILE.unlink(missing_ok=True)
+    def load(cls, name):
+        path = cls._path(name)
+        if not path.exists():
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("messages", [])
+
+    @classmethod
+    def save(cls, name, messages):
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cls._path(name), "w") as f:
+            json.dump(
+                {
+                    "name": name,
+                    "messages": messages,
+                    "updated": datetime.now().isoformat(),
+                },
+                f,
+                indent=2,
+            )
+
+    @classmethod
+    def delete(cls, name):
+        cls._path(name).unlink(missing_ok=True)
+
+    @classmethod
+    def list(cls):
+        """Return metadata for every saved session, newest first."""
+        if not SESSIONS_DIR.exists():
+            return []
+        sessions = []
+        for path in SESSIONS_DIR.glob("*.json"):
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            sessions.append(
+                {
+                    "name": data.get("name", path.stem),
+                    "updated": data.get("updated", ""),
+                    "count": len(data.get("messages", [])),
+                }
+            )
+        sessions.sort(key=lambda s: s["updated"], reverse=True)
+        return sessions
 
 
 # ── Command-history helpers ───────────────────────────────────────────────────
@@ -192,8 +235,16 @@ TOOLS = [
 
 # ── Tool implementations ──────────────────────────────────────────────────────
 
-def confirm(prompt):
-    return input(f"{prompt} [y/N] ").strip().lower() == "y"
+def confirm(prompt, default=True):
+    suffix = "[Y/n]" if default else "[y/N]"
+    response = input(f"{prompt} {suffix} ").strip().lower()
+    if not response:
+        return default
+    return response.startswith("y")
+
+
+# Paths the user has already made a write decision for, this session.
+_write_decisions = {}
 
 
 def tool_read_file(args):
@@ -208,8 +259,13 @@ def tool_read_file(args):
 def tool_write_file(args):
     path = os.path.expanduser(args["path"])
     content = args.get("content", "")
-    print(f"\n  write_file: {path} ({len(content)} bytes)")
-    if not confirm("  Allow this write?"):
+    if path in _write_decisions:
+        allowed = _write_decisions[path]
+    else:
+        print(f"\n  write_file: {path} ({len(content)} bytes)")
+        allowed = confirm("  Allow this write?", default=True)
+        _write_decisions[path] = allowed
+    if not allowed:
         return "[denied by user]"
     try:
         d = os.path.dirname(path)
@@ -242,7 +298,7 @@ def tool_run_command(args):
     print(f"\n  run_command: {command}")
     if DELETE_COMMAND_RE.search(command):
         print("  This command appears to delete files.")
-        if not confirm("  Allow it to run?"):
+        if not confirm("  Allow it to run?", default=False):
             return "[denied by user]"
     try:
         result = subprocess.run(
@@ -269,8 +325,87 @@ DISPATCH = {
 
 # ── API call ───────────────────────────────────────────────────────────────────
 
+class ModelUnavailable(Exception):
+    """Raised when the configured model is not served by the LocalAI instance."""
+
+    def __init__(self, model, available):
+        super().__init__(f"Model {model!r} is not available")
+        self.model = model
+        self.available = available
+
+
+def models_url(api_url):
+    """Derive the Open WebUI model-list endpoint from the chat-completions URL."""
+    return re.sub(r"/chat/completions/?$", "/models", api_url)
+
+
+# The server doesn't tag models by modality, so non-chat models are recognized by
+# name (embedding, reranking, speech, and image-generation models).
+NON_CHAT_PATTERN = re.compile(
+    r"embed|rerank|whisper|tts|stt|speech|transcrib|dall-?e|stable-?diffusion|sdxl|flux|moderation|clip",
+    re.IGNORECASE,
+)
+
+
+def is_chat_model(model):
+    """Heuristic: True unless the model is disabled or its name suggests a non-chat type."""
+    info = model.get("info") or {}
+    if info.get("is_active") is False:
+        return False
+    return not NON_CHAT_PATTERN.search(model["id"])
+
+
+def list_models(api_url, api_key):
+    """Return a sorted list of chat-model ids the server offers, or None if the query fails."""
+    req = urllib.request.Request(
+        models_url(api_url),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        ids = [m["id"] for m in data.get("data", []) if m.get("id") and is_chat_model(m)]
+        return sorted(set(ids))
+    except (urllib.error.URLError, json.JSONDecodeError, OSError, AttributeError, KeyError):
+        return None
+
+
+def format_unavailable(err):
+    lines = [f"Model {err.model!r} is not available on this server.", "Available models:"]
+    lines += [f"  {i}. {m}" for i, m in enumerate(err.available, 1)]
+    lines.append("Switch with: localai config set model <name>")
+    return "\n".join(lines)
+
+
+def prompt_model_switch(err):
+    """Ask the user to pick a replacement model. Returns the new model id, or None."""
+    print(f"\n{Fore.YELLOW}{format_unavailable(err).rsplit(chr(10), 1)[0]}{Style.RESET_ALL}")
+    while True:
+        try:
+            choice = input("Pick a number or model name to switch (blank to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not choice:
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(err.available):
+            return err.available[int(choice) - 1]
+        if choice in err.available:
+            return choice
+        print("  Not a valid choice.")
+
+
 def call_api(messages, api_url, api_key, model):
-    payload = json.dumps({"model": model, "messages": messages, "tools": TOOLS}).encode()
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "tools": TOOLS,
+            "stream": True,
+        }
+    ).encode()
     req = urllib.request.Request(
         api_url,
         data=payload,
@@ -295,8 +430,12 @@ def call_api(messages, api_url, api_key, model):
                 if data == "[DONE]":
                     break
                 chunk = json.loads(data)
-                choice = chunk["choices"][0]
-                delta = choice.get("delta", {})
+                choices = chunk.get("choices") or []
+                if not choices:
+                    # Usage-only or keep-alive chunks carry no choices.
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
                 if delta.get("content"):
                     content += delta["content"]
                 for tc in delta.get("tool_calls") or []:
@@ -312,7 +451,12 @@ def call_api(messages, api_url, api_key, model):
                 if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
     except urllib.error.HTTPError as e:
-        sys.exit(f"[http error] {e.code} {e.read().decode(errors='replace')}")
+        body = e.read().decode(errors="replace")
+        if e.code in (400, 404):
+            available = list_models(api_url, api_key)
+            if available and model not in available:
+                raise ModelUnavailable(model, available)
+        sys.exit(f"[http error] {e.code} {body}")
     except urllib.error.URLError as e:
         sys.exit(f"[connection error] {e}")
 
@@ -355,6 +499,15 @@ def run_turn(messages, api_url, api_key, model):
         return content
 
 
+def save_model(model):
+    data = Config.load()
+    data["model"] = model
+    Config.save(data)
+    print(f"  Switched to {model!r} (saved to {CONFIG_FILE})")
+    if os.environ.get("LOCALAI_MODEL"):
+        print("  Note: LOCALAI_MODEL is set in your environment and will override this next run.")
+
+
 def print_ai_response(content):
     """Render AI response using rich's Markdown renderer."""
     console = Console()
@@ -390,56 +543,78 @@ def main():
         return
 
     # ── Initialize messages ────────────────────────────────────────────────
+    # Every run starts from a clean conversation -- nothing is auto-loaded.
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    # Load existing session if available
-    existing_session = Session.load()
-    if existing_session:
-        print(f"Continuing session with {len(existing_session)} previous message(s)")
-        messages.extend(existing_session)
 
     # ── Handle session management ──────────────────────────────────────────
     if len(sys.argv) > 1 and sys.argv[1] == "session":
-        if len(sys.argv) > 2 and sys.argv[2] == "save":
-            Session.save(messages)
-            print(f"Session saved to {SESSION_FILE}")
+        sub = sys.argv[2] if len(sys.argv) > 2 else None
+        if sub == "save":
+            if len(sys.argv) < 4:
+                sys.exit("Usage: localai session save <name>")
+            name = sys.argv[3]
+            Session.save(name, messages)
+            print(f"Session saved as {name!r}")
             return
-        if len(sys.argv) > 2 and sys.argv[2] == "load":
-            messages = Session.load()
-            if not messages:
-                print("No session history found.")
+        if sub == "load":
+            if len(sys.argv) < 4:
+                sys.exit("Usage: localai session load <name>")
+            name = sys.argv[3]
+            loaded = Session.load(name)
+            if loaded is None:
+                print(f"No saved session named {name!r}.")
                 return
-            print(f"Loaded {len(messages)} messages from {SESSION_FILE}")
-            # Rebuild messages with system prompt
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-            return messages
-        if len(sys.argv) > 2 and sys.argv[2] == "clear":
-            Session.clear()
-            print(f"Cleared session history from {SESSION_FILE}")
+            print(f"Loaded {len(loaded)} message(s) from {name!r}")
             return
-        if len(sys.argv) > 2 and sys.argv[2] == "info":
-            if SESSION_FILE.exists():
-                import time
-                mtime = os.path.getmtime(SESSION_FILE)
-                print(f"Session file: {SESSION_FILE}")
-                print(f"Last modified: {datetime.fromtimestamp(mtime)}")
-                with open(SESSION_FILE) as f:
-                    data = json.load(f)
-                print(f"Messages stored: {len(data.get('messages', []))}")
-            else:
-                print("No session file found.")
-            return
-        if len(sys.argv) > 2 and sys.argv[2] == "export":
-            messages = Session.load()
-            if not messages:
-                print("No session history to export.")
+        if sub == "list":
+            sessions = Session.list()
+            if not sessions:
+                print("No saved sessions.")
                 return
-            filename = sys.argv[3] if len(sys.argv) > 3 else "session.json"
+            print(f"{'NAME':<24} {'MESSAGES':>8}  UPDATED")
+            for s in sessions:
+                print(f"{s['name']:<24} {s['count']:>8}  {s['updated']}")
+            return
+        if sub == "clear":
+            if len(sys.argv) < 4:
+                sys.exit("Usage: localai session clear <name>")
+            name = sys.argv[3]
+            if not Session.exists(name):
+                print(f"No saved session named {name!r}.")
+                return
+            Session.delete(name)
+            print(f"Deleted session {name!r}")
+            return
+        if sub == "info":
+            if len(sys.argv) < 4:
+                sys.exit("Usage: localai session info <name>")
+            name = sys.argv[3]
+            path = Session._path(name)
+            if not path.exists():
+                print(f"No saved session named {name!r}.")
+                return
+            mtime = os.path.getmtime(path)
+            with open(path) as f:
+                data = json.load(f)
+            print(f"Session: {name}")
+            print(f"File: {path}")
+            print(f"Last modified: {datetime.fromtimestamp(mtime)}")
+            print(f"Messages stored: {len(data.get('messages', []))}")
+            return
+        if sub == "export":
+            if len(sys.argv) < 4:
+                sys.exit("Usage: localai session export <name> [file]")
+            name = sys.argv[3]
+            loaded = Session.load(name)
+            if loaded is None:
+                print(f"No saved session named {name!r}.")
+                return
+            filename = sys.argv[4] if len(sys.argv) > 4 else f"{name}.json"
             with open(filename, "w") as f:
-                json.dump(messages, f, indent=2)
-            print(f"Exported {len(messages)} messages to {filename}")
+                json.dump(loaded, f, indent=2)
+            print(f"Exported {len(loaded)} messages to {filename}")
             return
-        print("Usage: localai session <save|load|clear|info|export> [file]")
+        print("Usage: localai session <save|load|list|clear|info|export> <name> [file]")
         return
 
     # ── Batch mode (single argument) ───────────────────────────────────────
@@ -447,14 +622,28 @@ def main():
         user_input = " ".join(sys.argv[1:])
         messages.append({"role": "user", "content": user_input})
         CommandHistory.save(user_input)
-        print_ai_response(run_turn(messages, api_url, api_key, model))
-        Session.save(messages)
+        try:
+            print_ai_response(run_turn(messages, api_url, api_key, model))
+        except ModelUnavailable as err:
+            sys.exit(format_unavailable(err))
         return
 
     # ── Interactive mode ──────────────────────────────────────────────────
+    current_session_name = None
+
+    # Startup check: verify the configured model exists before the first message.
+    # Best-effort -- if the model list can't be fetched, skip silently.
+    available = list_models(api_url, api_key)
+    if available and model not in available:
+        new_model = prompt_model_switch(ModelUnavailable(model, available))
+        if new_model:
+            model = new_model
+            save_model(model)
+        print()
+
     print(f"Chatting with {model} (filesystem + shell tools enabled)")
     print("  Type 'exit' to quit, 'history' to view commands,")
-    print("  'session save/load/clear' to manage conversation history,")
+    print("  'session save/load/list/info/clear <name>' to manage conversation history,")
     print("  'config set <key> <value>' to update settings,")
     print("  'clear' to clear current conversation,")
     print("  '!' to run a shell command.")
@@ -469,9 +658,11 @@ def main():
 
         stripped = user_input.strip()
         if stripped == "exit":
-            # Save before exiting
-            Session.save(messages)
-            print("Session saved. Goodbye.")
+            if current_session_name:
+                Session.save(current_session_name, messages)
+                print(f"Session {current_session_name!r} saved. Goodbye.")
+            else:
+                print("Goodbye. (conversation was not saved -- use 'session save <name>' to keep it)")
             break
         if not stripped:
             continue
@@ -479,7 +670,7 @@ def main():
         # ── Special commands ─────────────────────────────────────────────
         if stripped == "clear":
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            Session.save(messages)
+            current_session_name = None
             print("Conversation cleared.")
             continue
 
@@ -494,27 +685,76 @@ def main():
                 print("\n  No command history.")
             continue
 
-        if stripped in ("session", "session save", "session load", "session clear"):
-            if stripped == "session":
+        if stripped == "session" or stripped.startswith("session "):
+            parts = stripped.split()
+            sub = parts[1] if len(parts) > 1 else None
+
+            if sub is None:
                 print("\n  Session management:")
-                print("    session save   - save current conversation")
-                print("    session load   - load a saved conversation")
-                print("    session clear  - clear saved conversation")
-                print("    session info   - view session metadata")
-                print("    session export <file> - export to file")
-            elif stripped == "session save":
-                Session.save(messages)
-                print(f"\n  Session saved to {SESSION_FILE}")
-            elif stripped == "session load":
-                loaded = Session.load()
-                if loaded:
-                    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + loaded
-                    print(f"\n  Loaded {len(loaded)} message(s)")
+                print("    session save [name]  - save conversation (under current or given name)")
+                print("    session load <name>  - load a saved conversation")
+                print("    session list         - list saved sessions")
+                print("    session info [name]  - view session metadata (default: active session)")
+                print("    session clear <name> - delete a saved session")
+            elif sub == "save":
+                name = parts[2] if len(parts) > 2 else current_session_name
+                if not name:
+                    print("\n  Usage: session save <name>")
                 else:
-                    print("\n  No saved session found.")
-            elif stripped == "session clear":
-                Session.clear()
-                print("\n  Session history cleared.")
+                    Session.save(name, messages)
+                    current_session_name = name
+                    print(f"\n  Session saved as {name!r}")
+            elif sub == "load":
+                if len(parts) < 3:
+                    print("\n  Usage: session load <name>")
+                else:
+                    name = parts[2]
+                    loaded = Session.load(name)
+                    if loaded is None:
+                        print(f"\n  No saved session named {name!r}.")
+                    else:
+                        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + loaded
+                        current_session_name = name
+                        print(f"\n  Loaded {len(loaded)} message(s) from {name!r}")
+            elif sub == "list":
+                sessions = Session.list()
+                if not sessions:
+                    print("\n  No saved sessions.")
+                else:
+                    print(f"\n  {'NAME':<24} {'MESSAGES':>8}  UPDATED")
+                    for s in sessions:
+                        marker = "  *" if s["name"] == current_session_name else ""
+                        print(f"  {s['name']:<24} {s['count']:>8}  {s['updated']}{marker}")
+            elif sub == "info":
+                name = parts[2] if len(parts) > 2 else current_session_name
+                if not name:
+                    print("\n  Usage: session info <name>  (or load/save a session first)")
+                elif not Session.exists(name):
+                    print(f"\n  No saved session named {name!r}.")
+                else:
+                    path = Session._path(name)
+                    mtime = os.path.getmtime(path)
+                    with open(path) as f:
+                        data = json.load(f)
+                    active = "  (active)" if name == current_session_name else ""
+                    print(f"\n  Session: {name}{active}")
+                    print(f"  File: {path}")
+                    print(f"  Last modified: {datetime.fromtimestamp(mtime)}")
+                    print(f"  Messages stored: {len(data.get('messages', []))}")
+            elif sub == "clear":
+                if len(parts) < 3:
+                    print("\n  Usage: session clear <name>")
+                else:
+                    name = parts[2]
+                    if not Session.exists(name):
+                        print(f"\n  No saved session named {name!r}.")
+                    else:
+                        Session.delete(name)
+                        if current_session_name == name:
+                            current_session_name = None
+                        print(f"\n  Deleted session {name!r}")
+            else:
+                print(f"\n  Unknown session command: {sub}")
             continue
 
         if stripped.startswith("config set "):
@@ -548,24 +788,32 @@ def main():
         messages.append({"role": "user", "content": user_input})
         CommandHistory.save(user_input)
         try:
-            print_ai_response(run_turn(messages, api_url, api_key, model))
+            while True:
+                try:
+                    print_ai_response(run_turn(messages, api_url, api_key, model))
+                    break
+                except ModelUnavailable as err:
+                    new_model = prompt_model_switch(err)
+                    if not new_model:
+                        del messages[checkpoint:]
+                        print("(cancelled)")
+                        break
+                    model = new_model
+                    save_model(model)
         except KeyboardInterrupt:
             del messages[checkpoint:]
             print("\n(interrupted)")
 
-        # Save after each successful turn
-        Session.save(messages)
+        # Keep a named session in sync after each turn, if one is active
+        if current_session_name:
+            Session.save(current_session_name, messages)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        # Final save on Ctrl-C
-        try:
-            messages_save = messages if 'messages' in globals() else []
-            Session.save(messages_save)
-        except Exception:
-            pass
+        # Conversations are only persisted via an explicit named
+        # 'session save <name>', so there's nothing to auto-save here.
         print()
         sys.exit(0)
