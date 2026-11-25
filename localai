@@ -527,7 +527,7 @@ def print_config(active_model=None):
         print(f"  active model (this session): {active_model!r}")
 
 
-def print_available_models(api_url, api_key):
+def print_available_models(api_url, api_key, active_model=None):
     """Print the chat models the server offers."""
     available = list_models(api_url, api_key)
     if not available:
@@ -535,7 +535,10 @@ def print_available_models(api_url, api_key):
         return
     print("Available models:")
     for m in available:
-        print(f"  {m}")
+        marker = "*" if m == active_model else " "
+        print(f"{marker} {m}")
+    if active_model and active_model not in available:
+        print(f"(in use: {active_model!r}, not offered by the server)")
 
 
 def print_ai_response(content):
@@ -565,7 +568,7 @@ def main():
             Config.save(data)
             print(f"Saved {valid_keys[key]}={value!r} to {CONFIG_FILE}")
         elif len(sys.argv) > 3 and sys.argv[2] == "list" and sys.argv[3] == "model":
-            print_available_models(api_url, api_key)
+            print_available_models(api_url, api_key, model)
         else:
             print("# Current config:")
             print_config()
@@ -793,7 +796,7 @@ def main():
 
         if stripped in ("config list model", "config list models"):
             print()
-            print_available_models(api_url, api_key)
+            print_available_models(api_url, api_key, model)
             continue
 
         if stripped.startswith("config set "):
@@ -808,6 +811,11 @@ def main():
                 disk_data[key] = value
                 Config.save(disk_data)
                 print(f"\n  Saved {valid_keys_map[key]}={value!r} to {CONFIG_FILE}")
+                if key == "model":
+                    model = value
+                    print(f"  Now using {model!r} for this session.")
+                    if os.environ.get("LOCALAI_MODEL"):
+                        print("  Note: LOCALAI_MODEL is set in your environment and will override this next run.")
             else:
                 print("\n  Usage: config set <key> <value>")
             continue
